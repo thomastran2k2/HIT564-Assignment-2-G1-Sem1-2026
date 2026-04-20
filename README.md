@@ -1,16 +1,19 @@
 # PRT564 — Assessment 2 (Group 1)
 
-Exploratory analysis for **Northern Territory crime**, **population**, and **wholesale alcohol supply (PAC)**. This folder contains a single end-to-end script that **cleans and merges** the source files, writes an analysis-ready dataset, then **generates EDA figures** for RQ1 (monthly patterns) and RQ2 (assault and predictors).
+End-to-end pipeline for **Northern Territory crime**, **population**, and **wholesale alcohol supply (PAC)**. The main script **cleans + merges** the source files, writes an analysis-ready dataset, then runs:
+
+- **EDA** for RQ1 (monthly patterns) and RQ2 (assault + predictors)
+- **Regression modelling** for RQ2 (feature variants + Ridge/Lasso tuning + diagnostics)
 
 ## Requirements
 
 - **Python** 3.8+ recommended  
-- **Packages**: `pandas`, `numpy`, `matplotlib`, `seaborn`, `openpyxl` (for `.xlsx`)
+- **Packages**: `pandas`, `numpy`, `matplotlib`, `seaborn`, `openpyxl`, `scikit-learn`, `scipy`, `statsmodels`
 
 Install example:
 
 ```bash
-python -m pip install pandas numpy matplotlib seaborn openpyxl
+python -m pip install pandas numpy matplotlib seaborn openpyxl scikit-learn scipy statsmodels
 ```
 
 ## Input data
@@ -30,23 +33,34 @@ Place these files in the **same directory** as the script (paths are relative to
 From this folder:
 
 ```bash
-python 01_data_preprocessing_eda_2.py
+python 01_data_1.py
 ```
 
-The script runs **Steps 1–6** (load → merge → save CSV), then **EDA** (plots).
+The script runs **Steps 1–6** (load → merge → save CSV), then **EDA**, then **Regression**.
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
 | `nt_crime_merged.csv` | Merged, aggregated table: crime counts + population features + PAC columns + region dummies |
-| `eda_plots/*.png` | Figures listed below |
+| `eda_plots/*.png` | EDA figures listed below |
+| `regression_plots/*.png` | Regression figures (tuning, diagnostics, coefficients) |
 
 ### Generated plots (`eda_plots/`)
 
 - **Section 1 — Overview:** `1_1_population_by_region.png`, `1_2_offences_by_category.png`, `1_3_alcohol_dv_involvement.png`
 - **Section 2 — RQ1 (monthly patterns):** `2_1_offences_by_month.png`, `2_2_crime_rate_per_100k_by_month.png`, `2_3_monthly_trend_2024_vs_2025.png`, `2_4_heatmap_month_category.png`
 - **Section 3 — RQ2 (assault):** `3_1_assault_by_region.png` … `3_6_correlation_heatmap.png`
+- **Additional EDA:** `3_7_acf_assault_by_region.png` (ACF plot to justify lag features)
+
+### Generated plots (`regression_plots/`)
+
+The regression section saves multiple figures (exact filenames may change if the script is updated), including:
+
+- **Alpha tuning curves** for Ridge/Lasso (TimeSeriesSplit CV)
+- **Assumption checks** (residual plots, Shapiro–Wilk)
+- **Cross-validation / test performance comparisons**
+- **Model coefficients / feature importance**
 
 ## What the pipeline does (summary)
 
@@ -72,6 +86,11 @@ The script runs **Steps 1–6** (load → merge → save CSV), then **EDA** (plo
 
 6. **Modelling helpers**  
    - One-hot encodes **Region**; **Greater Darwin** is dropped as the **reference** category.
+
+7. **Regression (RQ2)**  
+   - Builds a monthly assault-rate dataset per region, engineers seasonal + lag features, and uses a **log transform** of assault rate.  
+   - Compares 4 feature variants (temporal → + alcohol → + crime context → + region).  
+   - Tunes **Ridge** and **Lasso** with **TimeSeriesSplit** cross-validation and runs diagnostics/assumption checks.
 
 ## Notes
 
