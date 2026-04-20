@@ -51,7 +51,7 @@ The script runs **Steps 1–6** (load → merge → save CSV), then **EDA**, the
 - **Section 1 — Overview:** `1_1_population_by_region.png`, `1_2_offences_by_category.png`, `1_3_alcohol_dv_involvement.png`
 - **Section 2 — RQ1 (monthly patterns):** `2_1_offences_by_month.png`, `2_2_crime_rate_per_100k_by_month.png`, `2_3_monthly_trend_2024_vs_2025.png`, `2_4_heatmap_month_category.png`
 - **Section 3 — RQ2 (assault):** `3_1_assault_by_region.png` … `3_6_correlation_heatmap.png`
-- **Additional EDA:** `3_7_acf_assault_by_region.png` (ACF plot to justify lag features)
+
 
 ### Generated plots (`regression_plots/`)
 
