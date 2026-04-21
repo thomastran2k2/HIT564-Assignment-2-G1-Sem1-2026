@@ -892,6 +892,46 @@ ax.set_ylim(0, max(rmse_vals) * 1.15)
 fig.tight_layout()
 save_reg(fig, "R1_feature_variants.png")
 
+# ── Step R2b: VIF Analysis ────────────────────────────────────────────────────
+# Before training, check for multicollinearity — the condition where two or more features are highly correlated, 
+# making it hard for the model to estimate their individual coefficients reliably.
+#
+# Variance Inflation Factor (VIF) measures how much the variance of a
+# coefficient is inflated due to correlation with other features:
+#   VIF = 1        : no correlation with other features
+#   VIF 1–10       : acceptable
+#   VIF > 10       : problematic multicollinearity
+#   VIF = infinity : perfect multicollinearity (feature is a linear combination
+#                    of others — e.g. pct_aboriginal + region dummies)
+ 
+print()
+print("-- Step R2b: VIF analysis (multicollinearity check) --")
+ 
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+ 
+X_train_vif = train[FEATURES].astype(float).values
+vif_df = pd.DataFrame({
+    "Feature": FEATURES,
+    "VIF": [variance_inflation_factor(X_train_vif, i)
+            for i in range(len(FEATURES))]
+}).sort_values("VIF", ascending=False)
+ 
+print()
+print("  VIF scores (rule of thumb: VIF > 10 = problematic; VIF = inf = perfect multicollinearity):")
+print(f"  {'Feature':<35} {'VIF':>10}  {'Assessment'}")
+print("  " + "-" * 70)
+for _, row in vif_df.iterrows():
+    vif_val = row["VIF"]
+    if vif_val > 50:
+        assessment = "High — expected (multiple lags or co-occurring counts)"
+    elif vif_val > 10:
+        assessment = "Elevated — monitor"
+    else:
+        assessment = "Acceptable"
+    vif_str = f"{vif_val:.1f}" if vif_val < 999 else "inf"
+    print(f"  {row['Feature']:<35} {vif_str:>10}  {assessment}")
+ 
+print()
 
 # ── Step R3: Hyperparameter tuning ────────────────────────────────────────────
 # WHY: Ridge and Lasso both have an alpha parameter controlling regularisation strength.
@@ -1242,17 +1282,5 @@ print()
 print("=" * 60)
 print("REGRESSION COMPLETE")
 print("=" * 60)
-print(f"Best feature variant : {best_variant}")
-print(f"Best model (by CV)   : {best_model_name}")
-print()
-print(f"{'Model':<25} {'Test RMSE(log)':<17} {'Test RMSE(100k)':<18} {'CV RMSE'}")
-print("-" * 75)
-for name, res in final_results.items():
-    marker = " <-- SELECTED" if name == best_model_name else ""
-    print(f"{name:<25} {res['rmse']:<17.4f} {res['rmse_bt']:<18.1f} {res['cv']:.4f}{marker}")
-print()
-print(f"Shapiro-Wilk (LR residuals): p={sw_p:.4f} -> "
-      f"{'normal' if sw_p>0.05 else 'not normal'}")
-print(f"All paired t-tests: p >> 0.05 -> no statistically significant difference between models")
 print(f"\nRegression plots saved to: {REG_PLOT_DIR}")
 
