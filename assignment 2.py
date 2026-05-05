@@ -725,6 +725,7 @@ fig.tight_layout()
 save(fig, "3_6_correlation_heatmap.png")
 
 
+
 # ── EDA Summary ───────────────────────────────────────────────────────────────
 print()
 print("=" * 60)
@@ -739,5 +740,547 @@ print(f"RQ2: Highest assault rate/100k = {top_region} "
       f"({region_assault.loc[top_region, 'Avg_rate']:,.0f})")
 print(f"RQ2: PAC vs Assault r          = {corr:.3f}")
 print(f"RQ2: Skewness original={skew_orig:.2f}, log={skew_log:.2f}")
-print(f"     -> Log transform recommended for regression")
-print(f"\nPlots saved to: {PLOT_DIR}")
+
+print(f"\nEDA plots saved to: {PLOT_DIR}")
+
+
+
+# == REGRESSION ================================================================
+# Research Question 2: Predict monthly assault rates for each NT region using
+# past crime data, population characteristics, and alcohol supply volumes.
+#
+# Approach:
+#   Step R1: Build regression dataset
+#   Step R2: Feature variant comparison (4 variants with Linear Regression)
+#   Step R3: Hyperparameter tuning (Ridge and Lasso, alpha grid search)
+#   Step R4: Final model comparison (LR vs best Ridge vs best Lasso)
+#   Step R5: Assumption checks (Shapiro-Wilk, residual plot)
+#   Step R6: TimeSeriesSplit cross-validation
+#   Step R7: Statistical significance tests (paired t-test)
+#   Step R8: Feature importance (Ridge + Lasso coefficients)
+# ==============================================================================
+
+print()
+print("=" * 60)
+print("REGRESSION: RQ2 - Predict Monthly Assault Rates")
+print("=" * 60)
+
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+import warnings
+warnings.filterwarnings("ignore")
+
+REG_PLOT_DIR = os.path.join(OUT_DIR, "regression_plots")
+os.makedirs(REG_PLOT_DIR, exist_ok=True)
+
+def save_reg(fig, name):
+    fig.savefig(os.path.join(REG_PLOT_DIR, name), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {name}")
+
+
+# ── Step R1: Build regression dataset ─────────────────────────────────────────
+print()
+print("-- Step R1: Build regression dataset --")
+
+assault_df = df[df["Offence category"] == "02 Assault"].copy()
+
+assault_reg = (
+    assault_df.groupby(["Year", "Quarter", "Month number", "Region"])
+    .agg(
+        Assault_offences = ("Number of offences", "sum"),
+        Alcohol_involved = ("Alcohol involvement", "sum"),
+        DV_involved      = ("DV involvement", "sum"),
+        Total_PAC        = ("Total PAC", "first"),
+        Total_population = ("Total_population", "first"),
+    )
+    .reset_index()
+    .sort_values(["Region", "Year", "Month number"])  # sort BEFORE lag
+    .reset_index(drop=True)
+)
+
+# Target: assault rate per 100k, then log-transformed
+# Why log: EDA showed skewness=0.82 -> log reduces to -0.06, satisfying
+# near-normality assumption for linear regression
+assault_reg["Assault_rate_100k"] = (
+    assault_reg["Assault_offences"] / assault_reg["Total_population"] * 100000
+).round(2)
+assault_reg["log_assault_rate"] = np.log1p(assault_reg["Assault_rate_100k"])
+
+# Feature engineering
+assault_reg["sin_month"]          = np.sin(2 * np.pi * assault_reg["Month number"] / 12)
+assault_reg["cos_month"]          = np.cos(2 * np.pi * assault_reg["Month number"] / 12)
+assault_reg["alcohol_per_capita"] = assault_reg["Total_PAC"] / assault_reg["Total_population"]
+
+# Lag features: sort MUST happen before shift() to guarantee correct order
+assault_reg["assault_rate_lag1"] = assault_reg.groupby("Region")["Assault_rate_100k"].shift(1)
+assault_reg["assault_rate_lag3"] = assault_reg.groupby("Region")["Assault_rate_100k"].shift(3)
+
+# Region dummies (Greater Darwin = reference category)
+reg_dummies = pd.get_dummies(assault_reg["Region"], prefix="Reg", drop_first=False)
+reg_dummies.drop(columns=["Reg_Greater Darwin"], inplace=True)
+assault_reg = pd.concat([assault_reg, reg_dummies], axis=1)
+assault_reg = assault_reg.dropna(subset=["assault_rate_lag1", "assault_rate_lag3"]).copy()
+
+train = assault_reg[assault_reg["Year"] == 2024].copy()
+test  = assault_reg[assault_reg["Year"] == 2025].copy()
+y_train = train["log_assault_rate"].astype(float).values
+y_test  = test["log_assault_rate"].astype(float).values
+
+print(f"Dataset: {assault_reg.shape[0]} rows | Train: {len(train)} | Test: {len(test)}")
+
+
+# ── Step R2: Feature variant comparison ───────────────────────────────────────
+# WHY: Before choosing a model, we need to understand which feature groups actually help.
+# We test 4 progressively richer feature sets using Linear Regression as a neutral baseline.
+# This tells us the marginal value of each feature group.
+# 
+#
+# V1: Temporal only      - sin/cos month + lag1 + lag3
+# V2: + Alcohol          - adds alcohol_per_capita
+# V3: + Crime context    - adds Alcohol_involved + DV_involved
+# V4: + Region dummies   - adds Reg_Barkly, Reg_Central Australia, Reg_East Arnhem
+
+print()
+print("-- Step R2: Feature variant comparison (Linear Regression baseline) --")
+
+VARIANTS = {
+    "V1: Temporal only":   ["sin_month", "cos_month", "assault_rate_lag1", "assault_rate_lag3"],
+    "V2: + Alcohol":       ["sin_month", "cos_month", "assault_rate_lag1", "assault_rate_lag3",
+                            "alcohol_per_capita"],
+    "V3: + Crime context": ["sin_month", "cos_month", "assault_rate_lag1", "assault_rate_lag3",
+                            "alcohol_per_capita", "Alcohol_involved", "DV_involved"],
+    "V4: + Region":        ["sin_month", "cos_month", "assault_rate_lag1", "assault_rate_lag3",
+                            "alcohol_per_capita", "Alcohol_involved", "DV_involved",
+                            "Reg_Barkly", "Reg_Central Australia", "Reg_East Arnhem"],
+}
+
+variant_rmse = {}
+variant_mae  = {}
+for name, feats in VARIANTS.items():
+    sc   = StandardScaler()
+    Xtr  = sc.fit_transform(train[feats].astype(float))
+    Xte  = sc.transform(test[feats].astype(float))
+    pred = LinearRegression().fit(Xtr, y_train).predict(Xte)
+    rmse = float(np.sqrt(mean_squared_error(y_test, pred)))
+    mae  = float(mean_absolute_error(y_test, pred))
+    variant_rmse[name] = rmse
+    variant_mae[name]  = mae
+    print(f"  {name:<28} RMSE={rmse:.4f}  MAE={mae:.4f}")
+
+best_variant = min(variant_rmse, key=variant_rmse.get)
+FEATURES = VARIANTS[best_variant]
+print(f"\n  -> Best variant: {best_variant} (RMSE={variant_rmse[best_variant]:.4f})")
+print(f"     Features selected: {FEATURES}")
+
+# Plot: feature variant RMSE comparison
+fig, ax = plt.subplots(figsize=(9, 4))
+variant_labels = [v.split(":")[0] for v in VARIANTS.keys()]
+rmse_vals = list(variant_rmse.values())
+colors = ["#EF5350" if v == min(rmse_vals) else "#90CAF9" for v in rmse_vals]
+bars = ax.bar(variant_labels, rmse_vals, color=colors, edgecolor="white", width=0.5)
+for bar, val in zip(bars, rmse_vals):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+            f"{val:.4f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+ax.set_xlabel("Feature Variant")
+ax.set_ylabel("RMSE (log scale)")
+ax.set_title("Feature Variant Comparison — Linear Regression\n(Lower RMSE = better, red = selected)")
+ax.set_ylim(0, max(rmse_vals) * 1.15)
+fig.tight_layout()
+save_reg(fig, "R1_feature_variants.png")
+
+# ── Step R2b: VIF Analysis ────────────────────────────────────────────────────
+# Before training, check for multicollinearity — the condition where two or more features are highly correlated, 
+# making it hard for the model to estimate their individual coefficients reliably.
+#
+# Variance Inflation Factor (VIF) measures how much the variance of a
+# coefficient is inflated due to correlation with other features:
+#   VIF = 1        : no correlation with other features
+#   VIF 1–10       : acceptable
+#   VIF > 10       : problematic multicollinearity
+#   VIF = infinity : perfect multicollinearity (feature is a linear combination
+#                    of others — e.g. pct_aboriginal + region dummies)
+ 
+print()
+print("-- Step R2b: VIF analysis (multicollinearity check) --")
+ 
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+ 
+X_train_vif = train[FEATURES].astype(float).values
+vif_df = pd.DataFrame({
+    "Feature": FEATURES,
+    "VIF": [variance_inflation_factor(X_train_vif, i)
+            for i in range(len(FEATURES))]
+}).sort_values("VIF", ascending=False)
+ 
+print()
+print("  VIF scores (rule of thumb: VIF > 10 = problematic; VIF = inf = perfect multicollinearity):")
+print(f"  {'Feature':<35} {'VIF':>10}  {'Assessment'}")
+print("  " + "-" * 70)
+for _, row in vif_df.iterrows():
+    vif_val = row["VIF"]
+    if vif_val > 50:
+        assessment = "High — expected (multiple lags or co-occurring counts)"
+    elif vif_val > 10:
+        assessment = "Elevated — monitor"
+    else:
+        assessment = "Acceptable"
+    vif_str = f"{vif_val:.1f}" if vif_val < 999 else "inf"
+    print(f"  {row['Feature']:<35} {vif_str:>10}  {assessment}")
+ 
+print()
+
+# ── Step R3: Hyperparameter tuning ────────────────────────────────────────────
+# WHY: Ridge and Lasso both have an alpha parameter controlling regularisation strength.
+# A fixed alpha (e.g. 1.0) is arbitrary — we must find the best value using cross-validation on the training data.
+# 
+# HOW: Grid search over alpha = [0.01, 0.1, 1, 10, 100] using TimeSeriesSplit CV (5 folds).
+# TimeSeriesSplit is used instead of random CV because our data is a time series,
+# and we must always train on past data and test on future data.
+
+print()
+print("-- Step R3: Hyperparameter tuning (alpha grid search via TimeSeriesSplit CV) --")
+
+X_all = assault_reg[FEATURES].astype(float).values
+y_all = assault_reg["log_assault_rate"].astype(float).values
+tscv  = TimeSeriesSplit(n_splits=5)
+ALPHAS = [0.01, 0.1, 1, 10, 100]
+
+ridge_cv = {}
+lasso_cv = {}
+
+print(f"  {'Alpha':<8} {'Ridge CV RMSE':<18} {'Lasso CV RMSE'}")
+for alpha in ALPHAS:
+    sc  = StandardScaler()
+    Xa  = sc.fit_transform(X_all)
+    r   = float(-cross_val_score(Ridge(alpha=alpha), Xa, y_all,
+                cv=tscv, scoring="neg_root_mean_squared_error").mean())
+    l   = float(-cross_val_score(Lasso(alpha=alpha, max_iter=10000), Xa, y_all,
+                cv=tscv, scoring="neg_root_mean_squared_error").mean())
+    ridge_cv[alpha] = r
+    lasso_cv[alpha] = l
+    print(f"  {alpha:<8} {r:<18.4f} {l:.4f}")
+
+best_ridge_alpha = min(ridge_cv, key=ridge_cv.get)
+best_lasso_alpha = min(lasso_cv, key=lasso_cv.get)
+print(f"\n  -> Best Ridge alpha = {best_ridge_alpha}  (CV RMSE={ridge_cv[best_ridge_alpha]:.4f})")
+print(f"  -> Best Lasso alpha = {best_lasso_alpha}  (CV RMSE={lasso_cv[best_lasso_alpha]:.4f})")
+
+# Plot: alpha tuning curves
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for ax, cv_dict, name, color in zip(
+    axes,
+    [ridge_cv, lasso_cv],
+    ["Ridge", "Lasso"],
+    ["#2196F3", "#FF9800"]
+):
+    best_a = min(cv_dict, key=cv_dict.get)
+    ax.plot(range(len(ALPHAS)), list(cv_dict.values()),
+            marker="o", linewidth=2, color=color)
+    best_idx = ALPHAS.index(best_a)
+    ax.scatter([best_idx], [cv_dict[best_a]], color="#EF5350", s=120, zorder=5,
+               label=f"Best alpha={best_a}")
+    ax.set_xticks(range(len(ALPHAS)))
+    ax.set_xticklabels([str(a) for a in ALPHAS])
+    ax.set_xlabel("Alpha")
+    ax.set_ylabel("CV RMSE (log scale)")
+    ax.set_title(f"{name} Regression — Alpha Tuning\n(TimeSeriesSplit, 5 folds)")
+    ax.legend()
+fig.suptitle("Hyperparameter Tuning: Finding Best Alpha", fontsize=13, fontweight="bold")
+fig.tight_layout()
+save_reg(fig, "R2_alpha_tuning.png")
+
+
+# ── Step R4: Final model comparison ───────────────────────────────────────────
+# WHY: Now that we have the best alpha for Ridge and Lasso, we compare all
+# three models on the held-out 2025 test set. We also run TimeSeriesSplit CV
+# to get a more reliable estimate of generalisation performance.
+
+print()
+print("-- Step R4: Final model comparison --")
+
+sc      = StandardScaler()
+Xtr_s   = sc.fit_transform(train[FEATURES].astype(float))
+Xte_s   = sc.transform(test[FEATURES].astype(float))
+
+final_models = {
+    "Linear Regression":           LinearRegression(),
+    f"Ridge (a={best_ridge_alpha})": Ridge(alpha=best_ridge_alpha),
+    f"Lasso (a={best_lasso_alpha})": Lasso(alpha=best_lasso_alpha, max_iter=10000),
+}
+
+final_results = {}
+print(f"  {'Model':<25} {'RMSE(log)':<12} {'MAE(log)':<12} {'RMSE(100k)':<14} {'CV RMSE'}")
+for name, model in final_models.items():
+    model.fit(Xtr_s, y_train)
+    pred    = model.predict(Xte_s)
+    rmse    = float(np.sqrt(mean_squared_error(y_test, pred)))
+    mae     = float(mean_absolute_error(y_test, pred))
+    rmse_bt = float(np.sqrt(mean_squared_error(np.expm1(y_test), np.expm1(pred))))
+    sc2     = StandardScaler()
+    cv_rmse = float(-cross_val_score(
+        model.__class__(**model.get_params()),
+        sc2.fit_transform(X_all), y_all,
+        cv=tscv, scoring="neg_root_mean_squared_error"
+    ).mean())
+    final_results[name] = {
+        "model": model, "pred": pred,
+        "rmse": rmse, "mae": mae, "rmse_bt": rmse_bt, "cv": cv_rmse
+    }
+    print(f"  {name:<25} {rmse:<12.4f} {mae:<12.4f} {rmse_bt:<14.1f} {cv_rmse:.4f}")
+
+# Select best model by CV RMSE
+best_model_name = min(final_results, key=lambda k: final_results[k]["cv"])
+print(f"\n  -> Best model by CV RMSE: {best_model_name}")
+
+# Plot: model comparison bar chart
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+model_names_short = ["LR", f"Ridge\na={best_ridge_alpha}", f"Lasso\na={best_lasso_alpha}"]
+test_rmses = [final_results[k]["rmse"] for k in final_results]
+cv_rmses   = [final_results[k]["cv"]   for k in final_results]
+
+for ax, vals, title, col in zip(
+    axes,
+    [test_rmses, cv_rmses],
+    ["Test RMSE (log scale)", "CV RMSE (TimeSeriesSplit, 5 folds)"],
+    ["#42A5F5", "#66BB6A"]
+):
+    best_idx = vals.index(min(vals))
+    bar_colors = ["#EF5350" if i == best_idx else col for i in range(len(vals))]
+    bars = ax.bar(model_names_short, vals, color=bar_colors, edgecolor="white", width=0.5)
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                f"{val:.4f}", ha="center", va="bottom", fontsize=10)
+    ax.set_ylabel("RMSE")
+    ax.set_title(title + "\n(red = best)")
+    ax.set_ylim(0, max(vals) * 1.2)
+
+fig.suptitle("Model Comparison: Linear Regression vs Ridge vs Lasso",
+             fontsize=13, fontweight="bold")
+fig.tight_layout()
+save_reg(fig, "R3_model_comparison.png")
+
+
+# ── Step R5: Assumption checks (Linear Regression baseline) ───────────────────
+
+print()
+print("-- Step R5: Assumption checks (Linear Regression) --")
+
+pred_lr   = final_results["Linear Regression"]["pred"]
+resid_lr  = y_test - pred_lr
+
+# Shapiro-Wilk test for normality of residuals
+# H0: Residuals are normally distributed
+# H1: Residuals are NOT normally distributed
+print("  Shapiro-Wilk Normality Test:")
+print("  H0: Residuals are normally distributed")
+print("  H1: Residuals are NOT normally distributed")
+sw_stat, sw_p = stats.shapiro(resid_lr)
+decision_sw = "Fail to reject H0 (residuals approximately normal)" if sw_p > 0.05 \
+              else "Reject H0 (residuals not normal)"
+print(f"  W={sw_stat:.4f}, p={sw_p:.4f} -> {decision_sw}")
+
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+axes[0].scatter(pred_lr, resid_lr, alpha=0.6, color="#2196F3", edgecolors="white", s=60)
+axes[0].axhline(0, color="red", linewidth=1.5, linestyle="--")
+axes[0].set_xlabel("Fitted Values (log scale)")
+axes[0].set_ylabel("Residuals")
+axes[0].set_title("Residuals vs Fitted\n(Random scatter = homoscedasticity satisfied)")
+
+stats.probplot(resid_lr, dist="norm", plot=axes[1])
+axes[1].set_title("Q-Q Plot of Residuals\n(Points on line = normality satisfied)")
+axes[1].get_lines()[0].set(color="#2196F3", markersize=5)
+axes[1].get_lines()[1].set(color="red", linewidth=1.5)
+
+fig.suptitle("Linear Regression Assumption Checks", fontsize=13, fontweight="bold")
+fig.tight_layout()
+save_reg(fig, "R4_assumption_checks.png")
+
+
+# ── Step R6: Predicted vs Actual (best model) ─────────────────────────────────
+
+best_pred    = final_results[best_model_name]["pred"]
+actual_bt    = np.expm1(y_test)
+best_pred_bt = np.expm1(best_pred)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+colors_region = sns.color_palette("tab10", n_colors=6)
+for region, color in zip(REGION_ORDER, colors_region):
+    mask = test["Region"] == region
+    ax.scatter(actual_bt[mask], best_pred_bt[mask],
+               label=region, color=color, alpha=0.75, s=60, edgecolors="white")
+lim = max(actual_bt.max(), best_pred_bt.max()) * 1.05
+ax.plot([0, lim], [0, lim], "r--", linewidth=1.5, label="Perfect prediction")
+ax.set_xlabel("Actual Assault Rate (per 100k)")
+ax.set_ylabel("Predicted Assault Rate (per 100k)")
+rmse_display = final_results[best_model_name]["rmse_bt"]
+ax.set_title(f"Predicted vs Actual — {best_model_name}\nRMSE = {rmse_display:.1f} per 100k (2025 test set)")
+ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left")
+fig.tight_layout()
+save_reg(fig, "R5_predicted_vs_actual.png")
+
+
+# ── Step R7: Statistical significance tests ────────────────────────────────────
+# WHY: RMSE differences alone don't tell us if one model is significantly better.
+# A paired t-test compares the absolute prediction errors of two models across
+# all 72 test observations. H0: mean |error| is equal for both models.
+
+print()
+print("-- Step R7: Statistical significance tests (paired t-test) --")
+print()
+print("  Hypotheses (applied to each model pair):")
+print("  H0: Mean absolute error of Model A = Mean absolute error of Model B")
+print("  H1: The two models have significantly different mean absolute errors")
+print("  Significance level: alpha = 0.05")
+print()
+
+model_names = list(final_results.keys())
+print(f"  {'Model A':<25} {'Model B':<25} {'t-stat':<10} {'p-value':<10} {'Decision'}")
+print("  " + "-" * 90)
+for i in range(len(model_names)):
+    for j in range(i+1, len(model_names)):
+        n1, n2 = model_names[i], model_names[j]
+        err1 = np.abs(y_test - final_results[n1]["pred"])
+        err2 = np.abs(y_test - final_results[n2]["pred"])
+        t_stat, p_val = stats.ttest_rel(err1, err2)
+        decision = "Reject H0 (SIGNIFICANT)" if p_val < 0.05 \
+                   else "Fail to reject H0 (not significant)"
+        print(f"  {n1:<25} {n2:<25} {t_stat:<10.4f} {p_val:<10.4f} {decision}")
+
+print()
+
+
+# ── Step R8: Feature importance ───────────────────────────────────────────────
+
+print()
+print("-- Step R8: Feature importance --")
+
+best_model = final_results[best_model_name]["model"]
+ridge_model = final_results[f"Ridge (a={best_ridge_alpha})"]["model"]
+lasso_model = final_results[f"Lasso (a={best_lasso_alpha})"]["model"]
+
+# Ridge coefficients
+ridge_coefs = pd.DataFrame({
+    "Feature":     FEATURES,
+    "Ridge":       ridge_model.coef_,
+    "Lasso":       lasso_model.coef_,
+}).sort_values("Ridge", key=abs, ascending=False)
+
+print("  Ridge and Lasso coefficients (standardised):")
+for _, row in ridge_coefs.iterrows():
+    lasso_status = "ZEROED" if abs(row["Lasso"]) < 1e-6 else "kept"
+    print(f"    {row['Feature']:<35} Ridge={row['Ridge']:+.4f}  Lasso={row['Lasso']:+.4f} [{lasso_status}]")
+
+# Plot: side-by-side coefficient comparison
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+for ax, col, name, color in zip(
+    axes,
+    ["Ridge", "Lasso"],
+    [f"Ridge (alpha={best_ridge_alpha})", f"Lasso (alpha={best_lasso_alpha})"],
+    ["#2196F3", "#FF9800"]
+):
+    coefs = ridge_coefs[col].values
+    bar_colors = ["#EF5350" if c < 0 else color for c in coefs]
+    ax.barh(ridge_coefs["Feature"], coefs, color=bar_colors, edgecolor="white")
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("Standardised Coefficient")
+    ax.set_title(f"{name}\n(Blue=positive effect, Red=negative effect)")
+
+fig.suptitle("Feature Coefficients: Ridge vs Lasso\n(Lasso zeros out less important features)",
+             fontsize=13, fontweight="bold")
+fig.tight_layout()
+save_reg(fig, "R6_coefficients.png")
+
+
+
+# ── Step R9: Predictions for each region (Answer to RQ2) ─────────────────────
+# RQ2 asks to PREDICT monthly assault rates — not just whether prediction is possible.
+# Here we produce actual predictions for each region in 2025 and
+# compare with observed values to answer RQ2 concretely.
+
+print()
+print("-- Step R9: Monthly predictions for each region (2025) --")
+
+pred_log_best    = final_results[best_model_name]["pred"]
+pred_rate_100k   = np.expm1(pred_log_best)
+actual_rate_100k = np.expm1(y_test)
+
+MONTH_LABELS_REG = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+pred_df = test[["Year", "Month number", "Region", "Assault_rate_100k"]].copy().reset_index(drop=True)
+pred_df["Month"]          = pred_df["Month number"].apply(lambda m: MONTH_LABELS_REG[m-1])
+pred_df["Actual_rate"]    = actual_rate_100k.round(1)
+pred_df["Predicted_rate"] = pred_rate_100k.round(1)
+pred_df["Error"]          = (pred_df["Predicted_rate"] - pred_df["Actual_rate"]).round(1)
+pred_df["Pct_error"]      = ((pred_df["Error"] / pred_df["Actual_rate"]) * 100).round(1)
+pred_df["Abs_error"]      = pred_df["Error"].abs()
+
+print()
+print(f"  {'Region':<22} {'Avg Actual':>12} {'Avg Predicted':>14} {'RMSE':>8} {'Mean Err%':>10}")
+print("  " + "-" * 70)
+for region in ["Barkly","Big Rivers","Central Australia","East Arnhem","Greater Darwin","Top End"]:
+    sub  = pred_df[pred_df["Region"] == region]
+    avg_a = sub["Actual_rate"].mean()
+    avg_p = sub["Predicted_rate"].mean()
+    rmse  = float(np.sqrt((sub["Error"]**2).mean()))
+    mpct  = sub["Pct_error"].mean()
+    print(f"  {region:<22} {avg_a:>12.1f} {avg_p:>14.1f} {rmse:>8.1f} {mpct:>9.1f}%")
+
+overall_rmse = float(np.sqrt(mean_squared_error(actual_rate_100k, pred_rate_100k)))
+overall_mae  = float(mean_absolute_error(actual_rate_100k, pred_rate_100k))
+print()
+print(f"  Overall RMSE (per 100k): {overall_rmse:.1f}")
+print(f"  Overall MAE  (per 100k): {overall_mae:.1f}")
+
+best5  = pred_df.nsmallest(5, "Abs_error")
+worst5 = pred_df.nlargest(5, "Abs_error")
+print()
+print("  Top 5 best predictions:")
+for _, r in best5.iterrows():
+    print(f"    {r['Region']:<22} {r['Month']}  actual={r['Actual_rate']:>7.1f}  predicted={r['Predicted_rate']:>7.1f}  error={r['Error']:>+7.1f}")
+print()
+print("  Top 5 worst predictions:")
+for _, r in worst5.iterrows():
+    print(f"    {r['Region']:<22} {r['Month']}  actual={r['Actual_rate']:>7.1f}  predicted={r['Predicted_rate']:>7.1f}  error={r['Error']:>+7.1f}")
+
+# Plot: Predicted vs Actual by region
+fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+axes = axes.flatten()
+REGION_ORDER_PRED = ["Barkly","Big Rivers","Central Australia","East Arnhem","Greater Darwin","Top End"]
+colors_pred = sns.color_palette("tab10", n_colors=6)
+
+for idx, (region, color) in enumerate(zip(REGION_ORDER_PRED, colors_pred)):
+    ax  = axes[idx]
+    sub = pred_df[pred_df["Region"] == region].sort_values("Month number")
+    ax.plot(sub["Month"], sub["Actual_rate"],    marker="o", linewidth=2, label="Actual",    color=color, alpha=0.9)
+    ax.plot(sub["Month"], sub["Predicted_rate"], marker="s", linewidth=2, linestyle="--", label="Predicted", color=color, alpha=0.6)
+    ax.fill_between(sub["Month"], sub["Actual_rate"], sub["Predicted_rate"], alpha=0.12, color=color)
+    rmse_r = float(np.sqrt(((sub["Error"])**2).mean()))
+    ax.set_title(f"{region}\nRMSE = {rmse_r:.0f} per 100k", fontsize=10, fontweight="bold")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Assault Rate (per 100k)")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend(fontsize=8)
+
+fig.suptitle(
+    f"Ridge Regression (alpha=10): Predicted vs Actual Assault Rate by Region (2025)\n"
+    f"Overall RMSE = {overall_rmse:.1f} per 100k  |  Overall MAE = {overall_mae:.1f} per 100k",
+    fontsize=12, fontweight="bold"
+)
+fig.tight_layout()
+save_reg(fig, "R7_predictions_by_region.png")
+
+
+# ── Regression Summary ────────────────────────────────────────────────────────
+
+print()
+print("=" * 60)
+print("REGRESSION COMPLETE")
+print("=" * 60)
+print(f"\nRegression plots saved to: {REG_PLOT_DIR}")
+
