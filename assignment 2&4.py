@@ -743,6 +743,46 @@ print(f"RQ2: Skewness original={skew_orig:.2f}, log={skew_log:.2f}")
 
 print(f"\nEDA plots saved to: {PLOT_DIR}")
 
+# == PCA =======================================================================
+# Principal Component Analysis on the 18 age-group demographic columns.
+# ==============================================================================
+
+print()
+print("=" * 60)
+print("PCA: Demographic Age-Group Columns")
+print("=" * 60)
+
+from sklearn.preprocessing import StandardScaler as _SS
+from sklearn.decomposition import PCA
+
+# ── Build the age-group matrix ─────────────────────────────────────────────────
+# Use the population features aggregated at region × year level (12 rows:
+# 6 regions × 2 years).
+
+age_cols = sorted([c for c in pop_features.columns if c.startswith("Pop_age_")])
+X_age    = pop_features[age_cols].astype(float).values   # shape (12, 18)
+
+print(f"  Age-group matrix: {X_age.shape[0]} rows (region×year) × {X_age.shape[1]} columns")
+
+# Standardise before PCA
+scaler_pca = _SS()
+X_age_sc   = scaler_pca.fit_transform(X_age)
+
+# Fit PCA retaining all components
+pca        = PCA()
+pca.fit(X_age_sc)
+
+explained      = pca.explained_variance_ratio_ * 100          # % per PC
+cumulative     = np.cumsum(explained)                          # cumulative %
+n_components   = X_age_sc.shape[1]                            # 18
+
+# ── Console summary ───────────────────────────────────────────────────────────
+print()
+print(f"  {'PC':<6} {'Explained Var (%)':>18} {'Cumulative (%)':>15}")
+print("  " + "-" * 75)
+
+for i in range(min(n_components, 6)):
+    print(f"  PC{i+1:<4} {explained[i]:>18.1f} {cumulative[i]:>15.1f}")
 
 
 # == REGRESSION ================================================================
@@ -1284,3 +1324,296 @@ print("REGRESSION COMPLETE")
 print("=" * 60)
 print(f"\nRegression plots saved to: {REG_PLOT_DIR}")
 
+# == CLASSIFICATION ============================================================
+# Research Question 3: Classify NT regions into High/Medium/Low risk for violent crime.
+# Research Question 4: Classify months into High/Medium/Low risk labels to support seasonal resource allocation planning.
+# ==============================================================================
+ 
+print()
+print("=" * 60)
+print("CLASSIFICATION: RQ3 & RQ4")
+print("=" * 60)
+ 
+CLS_PLOT_DIR = os.path.join(OUT_DIR, "classification_plots")
+os.makedirs(CLS_PLOT_DIR, exist_ok=True)
+ 
+def save_cls(fig, name):
+    fig.savefig(os.path.join(CLS_PLOT_DIR, name), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {name}")
+ 
+ 
+# ── Section 6.1: Classification Dataset & Risk Label Definition ───────────────
+print()
+print("-- Section 6.1: Classification Dataset & Risk Label Definition --")
+ 
+cls_df = assault_agg.copy()
+ 
+# ── Train / Test split ─────────────────────────────────────────────────────────
+cls_train = cls_df[cls_df["Year"] == 2024].copy().reset_index(drop=True)
+cls_test  = cls_df[cls_df["Year"] == 2025].copy().reset_index(drop=True)
+ 
+print(f"  Train obs (2024): {len(cls_train)}")
+print(f"  Test  obs (2025): {len(cls_test)}")
+ 
+q33 = cls_train["Assault_rate_100k"].quantile(0.33)
+q67 = cls_train["Assault_rate_100k"].quantile(0.67)
+ 
+print(f"\n  Risk label thresholds (from 2024 training set only):")
+print(f"    Low    : assault_rate_100k <= {q33:.1f}")
+print(f"    Medium : {q33:.1f} < assault_rate_100k <= {q67:.1f}")
+print(f"    High   : assault_rate_100k > {q67:.1f}")
+ 
+def assign_risk(rate):
+    if rate <= q33:  return "Low"
+    elif rate <= q67: return "Medium"
+    else:            return "High"
+ 
+cls_df["risk_class"]    = cls_df["Assault_rate_100k"].apply(assign_risk)
+cls_train["risk_class"] = cls_train["Assault_rate_100k"].apply(assign_risk)
+cls_test["risk_class"]  = cls_test["Assault_rate_100k"].apply(assign_risk)
+ 
+# ── Label distribution summary ─────────────────────────────────────────────────
+print()
+print("  Train label distribution (2024):")
+train_dist = cls_train["risk_class"].value_counts().reindex(["Low","Medium","High"])
+for label, count in train_dist.items():
+    pct = count / len(cls_train) * 100
+    print(f"    {label:<8}: {count:>3} obs  ({pct:.1f}%)")
+ 
+print()
+print("  Test label distribution (2025):")
+test_dist = cls_test["risk_class"].value_counts().reindex(["Low","Medium","High"])
+for label, count in test_dist.items():
+    pct = count / len(cls_test) * 100
+    print(f"    {label:<8}: {count:>3} obs  ({pct:.1f}%)")
+ 
+print()
+print("  Label distribution by region (train):")
+region_label = (cls_train.groupby(["Region","risk_class"])
+                .size().unstack(fill_value=0)
+                [["Low","Medium","High"]])
+print(region_label.to_string())
+ 
+print()
+print("  Label distribution by month (train):")
+month_label = (cls_train.groupby(["Month number","risk_class"])
+               .size().unstack(fill_value=0)
+               [["Low","Medium","High"]])
+print(month_label.to_string())
+ 
+ 
+# ── Section 6.2: Exploratory Data Analysis for Classification ─────────────────
+print()
+print("-- Section 6.2: EDA for Classification --")
+ 
+RISK_COLORS  = {"Low": "#42A5F5", "Medium": "#FF9800", "High": "#EF5350"}
+RISK_ORDER   = ["Low", "Medium", "High"]
+MONTH_LABELS_CLS = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"]
+ 
+# ── Plot C1: Risk label distribution by region ──────────────────
+# PURPOSE: Show that labels are NOT uniformly distributed across regions.
+# This validates the labelling scheme and motivates region dummy features.
+ 
+region_pct = (
+    cls_train.groupby(["Region","risk_class"])
+    .size().unstack(fill_value=0)
+    [["Low","Medium","High"]]
+)
+region_pct_norm = region_pct.div(region_pct.sum(axis=1), axis=0) * 100
+region_pct_norm = region_pct_norm.loc[REGION_ORDER]
+ 
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+ 
+# Left: stacked bar — proportion
+bottoms = np.zeros(len(REGION_ORDER))
+for label in RISK_ORDER:
+    vals = region_pct_norm[label].values
+    axes[0].barh(REGION_ORDER, vals, left=bottoms,
+                 color=RISK_COLORS[label], label=label, edgecolor="white")
+    for i, (v, b) in enumerate(zip(vals, bottoms)):
+        if v > 5:
+            axes[0].text(b + v/2, i, f"{v:.0f}%",
+                        ha="center", va="center", fontsize=8,
+                        color="white", fontweight="bold")
+    bottoms += vals
+ 
+axes[0].set_xlabel("Proportion (%)")
+axes[0].set_title("Risk Label Distribution by Region\n(proportion, 2024 training set)")
+axes[0].legend(title="Risk Class", loc="lower right")
+axes[0].set_xlim(0, 100)
+axes[0].invert_yaxis()
+ 
+# Right: raw count
+bottoms = np.zeros(len(REGION_ORDER))
+for label in RISK_ORDER:
+    vals = region_pct[label].values.astype(float)
+    axes[1].barh(REGION_ORDER, vals, left=bottoms,
+                 color=RISK_COLORS[label], label=label, edgecolor="white")
+    for i, (v, b) in enumerate(zip(vals, bottoms)):
+        if v > 0:
+            axes[1].text(b + v/2, i, f"{int(v)}",
+                        ha="center", va="center", fontsize=9,
+                        color="white", fontweight="bold")
+    bottoms += vals
+ 
+axes[1].set_xlabel("Number of Observations")
+axes[1].set_title("Risk Label Distribution by Region\n(raw count, 2024 training set)")
+axes[1].legend(title="Risk Class", loc="lower right")
+axes[1].invert_yaxis()
+ 
+fig.suptitle(
+    "Classification EDA — Risk Label Distribution by Region\n",
+    fontsize=12, fontweight="bold"
+)
+fig.tight_layout()
+save_cls(fig, "C1_risk_label_by_region.png")
+ 
+# ── Plot C2: Risk label by month heatmap ──────────────────────────────────────
+# PURPOSE: Show which months are associated with higher risk across regions.
+# Directly informs RQ4: month-level risk classification.
+ 
+month_label_full = (
+    cls_train.groupby(["Month number", "risk_class"])
+    .size().unstack(fill_value=0)
+    [["Low","Medium","High"]]
+)
+month_label_full.index = [MONTH_LABELS_CLS[m-1] for m in month_label_full.index]
+ 
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+ 
+# Left: heatmap of counts
+sns.heatmap(
+    month_label_full, annot=True, fmt="d", cmap="YlOrRd",
+    linewidths=0.5, ax=axes[0],
+    cbar_kws={"label": "Number of Region-Months"}
+)
+axes[0].set_title("Risk Label Count by Month\n(2024 training set)")
+axes[0].set_xlabel("Risk Class")
+axes[0].set_ylabel("Month")
+ 
+# Right: stacked bar by month
+month_pct_m = month_label_full.div(month_label_full.sum(axis=1), axis=0) * 100
+bottoms_m = np.zeros(12)
+months_idx = list(month_label_full.index)
+for label in RISK_ORDER:
+    vals = month_pct_m[label].values
+    axes[1].bar(months_idx, vals, bottom=bottoms_m,
+                color=RISK_COLORS[label], label=label,
+                edgecolor="white", width=0.7)
+    bottoms_m += vals
+ 
+axes[1].set_xlabel("Month")
+axes[1].set_ylabel("Proportion (%)")
+axes[1].set_title("Risk Label Proportion by Month\n(2024 training set)")
+axes[1].legend(title="Risk Class")
+axes[1].tick_params(axis="x", rotation=45)
+ 
+fig.suptitle(
+    "Classification EDA — Risk Label Distribution by Month\n",
+    fontsize=12, fontweight="bold"
+)
+fig.tight_layout()
+save_cls(fig, "C2_risk_label_by_month.png")
+ 
+# ── Plot C3: Season (Wet/Dry) vs risk class ───────────────────────────────────
+# PURPOSE: Justify the Season feature added in classification feature engineering.
+# Wet Season = Nov–Apr (month 11,12,1,2,3,4); Dry Season = May–Oct (5,6,7,8,9,10)
+ 
+cls_train_s = cls_train.copy()
+cls_train_s["Season"] = cls_train_s["Month number"].apply(
+    lambda m: "Wet (Nov–Apr)" if m in [11,12,1,2,3,4] else "Dry (May–Oct)"
+)
+ 
+season_risk = (
+    cls_train_s.groupby(["Season","risk_class"])
+    .size().unstack(fill_value=0)
+    [["Low","Medium","High"]]
+)
+season_pct = season_risk.div(season_risk.sum(axis=1), axis=0) * 100
+ 
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+ 
+# Left: raw counts
+x = np.arange(len(season_risk))
+w = 0.25
+for i, (label, color) in enumerate(RISK_COLORS.items()):
+    axes[0].bar(x + i*w, season_risk[label].values, w,
+                label=label, color=color, edgecolor="white")
+axes[0].set_xticks(x + w)
+axes[0].set_xticklabels(season_risk.index)
+axes[0].set_ylabel("Number of Observations")
+axes[0].set_title("Risk Class by Season\n(raw count, 2024 training set)")
+axes[0].legend(title="Risk Class")
+for i, label in enumerate(RISK_ORDER):
+    for j, val in enumerate(season_risk[label].values):
+        axes[0].text(j + i*w, val + 0.2, str(int(val)),
+                    ha="center", va="bottom", fontsize=9)
+ 
+# Right: proportion
+bottoms_s = np.zeros(len(season_pct))
+for label in RISK_ORDER:
+    vals = season_pct[label].values
+    axes[1].bar(season_pct.index, vals, bottom=bottoms_s,
+                color=RISK_COLORS[label], label=label,
+                edgecolor="white", width=0.5)
+    for i, (v, b) in enumerate(zip(vals, bottoms_s)):
+        if v > 4:
+            axes[1].text(i, b + v/2, f"{v:.0f}%",
+                        ha="center", va="center",
+                        fontsize=10, color="white", fontweight="bold")
+    bottoms_s += vals
+ 
+axes[1].set_ylabel("Proportion (%)")
+axes[1].set_title("Risk Class Proportion by Season\n(2024 training set)")
+axes[1].legend(title="Risk Class", loc="upper right")
+axes[1].set_ylim(0, 105)
+ 
+fig.suptitle(
+    "Classification EDA — Season vs Risk Class\n",
+    fontsize=12, fontweight="bold"
+)
+fig.tight_layout()
+save_cls(fig, "C3_season_vs_risk.png")
+ 
+# ── Plot C4: Assault rate distribution by risk class (box plot) ───────────────
+# PURPOSE: Validate that the three risk classes are meaningfully separated
+# in terms of the underlying assault rate — not arbitrary groupings.
+ 
+fig, ax = plt.subplots(figsize=(9, 5))
+for i, (label, color) in enumerate(RISK_COLORS.items()):
+    subset = cls_train[cls_train["risk_class"] == label]["Assault_rate_100k"]
+    bp = ax.boxplot(subset, positions=[i], widths=0.5, patch_artist=True,
+                    boxprops=dict(facecolor=color, alpha=0.7),
+                    medianprops=dict(color="black", linewidth=2),
+                    whiskerprops=dict(linewidth=1.5),
+                    capprops=dict(linewidth=1.5),
+                    flierprops=dict(marker="o", markerfacecolor=color,
+                                   markersize=5, alpha=0.6))
+ 
+ax.axhline(q33, color="#FF9800", linewidth=1.5, linestyle="--",
+           label=f"Low/Medium boundary: {q33:.0f}")
+ax.axhline(q67, color="#EF5350", linewidth=1.5, linestyle="--",
+           label=f"Medium/High boundary: {q67:.0f}")
+ax.set_xticks([0,1,2])
+ax.set_xticklabels(["Low","Medium","High"])
+ax.set_xlabel("Risk Class")
+ax.set_ylabel("Assault Rate (per 100,000 population)")
+ax.set_title(
+    f"Assault Rate Distribution by Risk Class (2024 training set)\n"
+    f"Thresholds: Low ≤ {q33:.0f} | Medium ≤ {q67:.0f} | High > {q67:.0f} per 100k"
+)
+ax.legend()
+fig.tight_layout()
+save_cls(fig, "C4_rate_distribution_by_class.png")
+ 
+# ── Summary ───────────────────────────────────────────────────────────────────
+print()
+print("=" * 60)
+print("CLASSIFICATION SECTION 6.1 & 6.2 COMPLETE")
+print("=" * 60)
+print(f"\n  Risk thresholds (from 2024 train set):")
+print(f"    Low    : <= {q33:.1f} per 100k")
+print(f"    Medium : {q33:.1f} – {q67:.1f} per 100k")
+print(f"    High   : > {q67:.1f} per 100k")
